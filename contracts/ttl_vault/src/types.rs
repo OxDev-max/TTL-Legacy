@@ -33,6 +33,9 @@ pub const DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("disp_res");
 pub const WITHDRAWAL_SCHEDULED_TOPIC: Symbol = symbol_short!("wd_sch");
 pub const WITHDRAWAL_EXECUTED_TOPIC: Symbol = symbol_short!("wd_exec");
 pub const CONDITIONS_ACCEPTED_TOPIC: Symbol = symbol_short!("cond_acc");
+pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_cloned");
+pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merged");
+pub const ACCEPTANCE_DEADLINE_EXPIRED_TOPIC: Symbol = symbol_short!("acc_exp");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -79,6 +82,7 @@ pub enum DataKey {
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
+    VaultActivityLog(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -252,4 +256,15 @@ pub struct WithdrawalScheduleEntry {
 pub struct ConditionalAcceptanceEntry {
     pub conditions: String,
     pub approved_by_owner: bool,
+    pub acceptance_deadline: Option<u64>,
+}
+
+/// Activity log entry for forensic audit trail
+#[contracttype]
+#[derive(Clone)]
+pub struct ActivityLogEntry {
+    pub action: String,
+    pub caller: Address,
+    pub timestamp: u64,
+    pub details: String,
 }

@@ -3037,3 +3037,91 @@ fn test_cannot_file_duplicate_dispute() {
     let result = client.try_file_dispute(&vault_id, &reason2);
     assert!(result.is_err());
 }
+
+// ---- Task 1: clone_vault tests ----
+
+#[test]
+fn test_clone_vault_preserves_config() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_beneficiary = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let cloned_id = client.clone_vault(&vault_id, &owner, &new_beneficiary);
+
+    let original = client.get_vault(&vault_id);
+    let cloned = client.get_vault(&cloned_id);
+
+    assert_eq!(cloned.check_in_interval, original.check_in_interval);
+    assert_eq!(cloned.token_address, original.token_address);
+    assert_eq!(cloned.owner, owner);
+    assert_eq!(cloned.beneficiary, new_beneficiary);
+    assert_eq!(cloned.balance, 0);
+    assert_eq!(cloned.parent_vault_id, Some(vault_id));
+}
+
+#[test]
+fn test_clone_vault_preserves_custom_metadata() {
+    use soroban_sdk::Bytes;
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_beneficiary = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let meta = Bytes::from_slice(&env, &[1u8, 2u8, 3u8]);
+    client.set_vault_metadata(&vault_id, &owner, &meta);
+
+    let cloned_id = client.clone_vault(&vault_id, &owner, &new_beneficiary);
+    let cloned = client.get_vault(&cloned_id);
+
+    assert_eq!(cloned.custom_metadata, meta);
+}
+
+#[test]
+fn test_clone_vault_multi_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_beneficiary = Address::generate(&env);
+    let b2 = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let bens = vec![
+        &env,
+        BeneficiaryEntry { address: beneficiary.clone(), bps: 6000 },
+        BeneficiaryEntry { address: b2.clone(), bps: 4000 },
+    ];
+    client.set_beneficiaries(&vault_id, &owner, &bens);
+
+    let cloned_id = client.clone_vault(&vault_id, &owner, &new_beneficiary);
+    let cloned = client.get_vault(&cloned_id);
+
+    assert_eq!(cloned.beneficiaries.len(), 2);
+}
+
+#[test]
+fn test_clone_vault_not_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let other = Address::generate(&env);
+    let new_beneficiary = Address::generate(&env);
+
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let result = client.try_clone_vault(&vault_id, &other, &new_beneficiary);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_clone_vault_owner_equals_beneficiary_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let result = client.try_clone_vault(&vault_id, &owner, &owner);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_clone_vault_emits_activity_log() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let new_ben = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let cloned_id = client.clone_vault(&vault_id, &owner, &new_ben);
+
+    let log = client.get_vault_activity_log(&cloned_id);
+    assert!(!log.is_empty());
+    assert_eq!(log.get(0).unwrap().action, String::from_str(&env, "clone_vault"));
+}
