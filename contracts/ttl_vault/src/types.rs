@@ -63,6 +63,18 @@ pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
 pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
 pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
 
+// Previously missing topics referenced in lib.rs
+pub const STATE_TRANSITION_TOPIC: Symbol = symbol_short!("st_trans");
+pub const OWNERSHIP_PROOF_TOPIC: Symbol = symbol_short!("own_prf");
+pub const INTEGRITY_TOPIC: Symbol = symbol_short!("integrity");
+pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
+
+// Shared TTL Pool events
+pub const TTL_POOL_CREATED_TOPIC: Symbol = symbol_short!("pool_new");
+pub const TTL_POOL_VAULT_ADDED_TOPIC: Symbol = symbol_short!("pool_add");
+pub const TTL_POOL_VAULT_REMOVED_TOPIC: Symbol = symbol_short!("pool_rm");
+pub const TTL_POOL_CHECK_IN_TOPIC: Symbol = symbol_short!("pool_ci");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -123,6 +135,13 @@ pub enum DataKey {
     MultiSigProposalCount(u64),
     MetadataHistory(u64),
     OwnerVaultCount(Address),
+    // Shared TTL Pool
+    TtlPool(u64),
+    TtlPoolCount,
+    TtlPoolVaults(u64),
+    VaultPool(u64),
+    // State transition audit log
+    StateTransitionLog(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -432,4 +451,16 @@ pub struct VaultStatusSummary {
     pub balance: i128,
     pub last_check_in: u64,
     pub is_expired: bool,
+}
+
+/// A shared TTL pool that multiple vaults can join.
+/// A single `pool_check_in` resets `last_check_in` for all member vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlPool {
+    pub pool_id: u64,
+    pub owner: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub created_at: u64,
 }

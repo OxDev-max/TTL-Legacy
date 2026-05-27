@@ -90,3 +90,39 @@ To restore an archived vault:
 3. The vault becomes accessible again with extended TTL
 
 The `trigger_release` function automatically attempts restoration if the vault is archived.
+
+## Shared TTL Pool
+
+Multiple vaults can share a common TTL pool for more efficient storage management. Instead of each vault requiring its own check-in transaction, a single `pool_check_in` resets `last_check_in` for all member vaults simultaneously.
+
+### Pool Lifecycle
+
+1. Owner calls `create_ttl_pool(owner, check_in_interval)` → returns `pool_id`
+2. Vault owners call `add_vault_to_pool(pool_id, vault_id, caller)` to join
+3. Pool owner calls `pool_check_in(pool_id, caller)` to reset all member vaults
+4. Vault owners call `remove_vault_from_pool(vault_id, caller)` to leave
+
+### Pool API
+
+```rust
+create_ttl_pool(owner: Address, check_in_interval: u64) -> u64
+add_vault_to_pool(pool_id: u64, vault_id: u64, caller: Address) -> Result<(), ContractError>
+remove_vault_from_pool(vault_id: u64, caller: Address) -> Result<(), ContractError>
+pool_check_in(pool_id: u64, caller: Address) -> Result<(), ContractError>
+get_ttl_pool(pool_id: u64) -> Option<TtlPool>
+get_pool_vaults(pool_id: u64) -> Vec<u64>
+get_vault_pool(vault_id: u64) -> Option<u64>
+```
+
+### Events
+
+| Topic | Data | Description |
+|---|---|---|
+| `pool_new` | `(pool_id, owner, interval, timestamp)` | Pool created |
+| `pool_add` | `(pool_id, vault_id)` | Vault added to pool |
+| `pool_rm` | `(pool_id, vault_id)` | Vault removed from pool |
+| `pool_ci` | `(pool_id, timestamp, member_count)` | Pool check-in performed |
+
+### Storage Efficiency
+
+Without a pool, N vaults require N separate check-in transactions. With a pool, a single `pool_check_in` updates all N vaults in one transaction, reducing ledger fees and simplifying owner workflows. Released vaults in a pool are silently skipped.

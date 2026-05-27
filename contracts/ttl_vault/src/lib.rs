@@ -30,6 +30,9 @@ use types::{
     OWNERSHIP_CANCELLED_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC,
+    STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
+    TtlPool, TTL_POOL_CREATED_TOPIC, TTL_POOL_VAULT_ADDED_TOPIC, TTL_POOL_VAULT_REMOVED_TOPIC,
+    TTL_POOL_CHECK_IN_TOPIC,
 };
 
 #[cfg(test)]
@@ -4896,5 +4899,227 @@ impl TtlVaultContract {
         Self::save_vault(env, vault_id, &v);
         env.events().publish((WITHDRAW_TOPIC, vault_id), (amount, v.balance));
         Ok(())
+    }
+
+    // ── Shared TTL Pool ───────────────────────────────────────────────────────
+
+    /// Creates a shared TTL pool. Multiple vaults can join the pool and share
+    /// a single check-in to extend all their TTLs simultaneously.
+    ///
+    /// # Arguments
+    /// * `owner` - Pool owner (must authorize)
+    /// * `check_in_interval` - Shared interval in seconds (must be > 0)
+    ///
+    /// # Returns
+    /// The new pool ID
+    pub fn create_ttl_pool(env: Env, owner: Address, check_in_interval: u64) -> u64 {
+        owner.require_auth();
+        Self::require_initialized(&env);
+        if check_in_interval == 0 {
+            panic_with_error!(&env, ContractError::InvalidInterval);
+        }
+        Self::assert_interval_in_bounds(&env, check_in_interval);
+
+        let pool_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TtlPoolCount)
+            .unwrap_or(0u64)
+            + 1;
+
+        let now = env.ledger().timestamp();
+        let pool = TtlPool {
+            pool_id,
+            owner: owner.clone(),
+            check_in_interval,
+            last_check_in: now,
+            created_at: now,
+        };
+
+        let pool_key = DataKey::TtlPool(pool_id);
+        let ttl = vault_ttl_ledgers(check_in_interval);
+        env.storage().persistent().set(&pool_key, &pool);
+        env.storage().persistent().extend_ttl(&pool_key, VAULT_TTL_THRESHOLD, ttl);
+
+        let vaults_key = DataKey::TtlPoolVaults(pool_id);
+        let empty: Vec<u64> = Vec::new(&env);
+        env.storage().persistent().set(&vaults_key, &empty);
+        env.storage().persistent().extend_ttl(&vaults_key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.storage().persistent().set(&DataKey::TtlPoolCount, &pool_id);
+        env.storage().persistent().extend_ttl(&DataKey::TtlPoolCount, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((TTL_POOL_CREATED_TOPIC,), (pool_id, owner, check_in_interval, now));
+        pool_id
+    }
+
+    /// Adds a vault to a TTL pool. The vault owner must authorize.
+    /// Once added, a `pool_check_in` will reset this vault's `last_check_in`.
+    ///
+    /// # Errors
+    /// * `NotOwner` - If caller is not the vault owner
+    /// * `AlreadyReleased` - If vault is not Locked
+    /// * `VaultNotFound` - If pool does not exist
+    pub fn add_vault_to_pool(
+        env: Env,
+        pool_id: u64,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if !env.storage().persistent().has(&DataKey::TtlPool(pool_id)) {
+            return Err(ContractError::VaultNotFound);
+        }
+
+        // Record which pool this vault belongs to
+        let vault_pool_key = DataKey::VaultPool(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&vault_pool_key, &pool_id);
+        env.storage().persistent().extend_ttl(&vault_pool_key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Add vault to pool's member list (prevent duplicates)
+        let vaults_key = DataKey::TtlPoolVaults(pool_id);
+        let mut members: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&vaults_key)
+            .unwrap_or(Vec::new(&env));
+        if !members.iter().any(|id| id == vault_id) {
+            members.push_back(vault_id);
+            let pool: TtlPool = env.storage().persistent().get(&DataKey::TtlPool(pool_id)).unwrap();
+            let pool_ttl = vault_ttl_ledgers(pool.check_in_interval);
+            env.storage().persistent().set(&vaults_key, &members);
+            env.storage().persistent().extend_ttl(&vaults_key, VAULT_TTL_THRESHOLD, pool_ttl);
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((TTL_POOL_VAULT_ADDED_TOPIC,), (pool_id, vault_id));
+        Ok(())
+    }
+
+    /// Removes a vault from its TTL pool. The vault owner must authorize.
+    ///
+    /// # Errors
+    /// * `NotOwner` - If caller is not the vault owner
+    /// * `VaultNotFound` - If vault is not in any pool
+    pub fn remove_vault_from_pool(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let vault_pool_key = DataKey::VaultPool(vault_id);
+        let pool_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&vault_pool_key)
+            .ok_or(ContractError::VaultNotFound)?;
+
+        env.storage().persistent().remove(&vault_pool_key);
+
+        let vaults_key = DataKey::TtlPoolVaults(pool_id);
+        let members: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&vaults_key)
+            .unwrap_or(Vec::new(&env));
+        let mut updated = Vec::new(&env);
+        for id in members.iter() {
+            if id != vault_id {
+                updated.push_back(id);
+            }
+        }
+        if let Some(pool) = env.storage().persistent().get::<DataKey, TtlPool>(&DataKey::TtlPool(pool_id)) {
+            let pool_ttl = vault_ttl_ledgers(pool.check_in_interval);
+            env.storage().persistent().set(&vaults_key, &updated);
+            env.storage().persistent().extend_ttl(&vaults_key, VAULT_TTL_THRESHOLD, pool_ttl);
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((TTL_POOL_VAULT_REMOVED_TOPIC,), (pool_id, vault_id));
+        Ok(())
+    }
+
+    /// Performs a single check-in that resets `last_check_in` for all Locked
+    /// vaults in the pool. Only the pool owner may call this.
+    ///
+    /// # Errors
+    /// * `Paused` - If the contract is paused
+    /// * `NotOwner` - If caller is not the pool owner
+    /// * `VaultNotFound` - If pool does not exist
+    pub fn pool_check_in(env: Env, pool_id: u64, caller: Address) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+
+        let pool_key = DataKey::TtlPool(pool_id);
+        let mut pool: TtlPool = env
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .ok_or(ContractError::VaultNotFound)?;
+
+        if caller != pool.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let now = env.ledger().timestamp();
+        pool.last_check_in = now;
+        let pool_ttl = vault_ttl_ledgers(pool.check_in_interval);
+        env.storage().persistent().set(&pool_key, &pool);
+        env.storage().persistent().extend_ttl(&pool_key, VAULT_TTL_THRESHOLD, pool_ttl);
+
+        // Reset last_check_in for all Locked member vaults
+        let vaults_key = DataKey::TtlPoolVaults(pool_id);
+        let members: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&vaults_key)
+            .unwrap_or(Vec::new(&env));
+
+        for vault_id in members.iter() {
+            if let Some(mut vault) = Self::try_load_vault(&env, vault_id) {
+                if vault.status == ReleaseStatus::Locked {
+                    vault.last_check_in = now;
+                    Self::save_vault(&env, vault_id, &vault);
+                    env.events().publish((CHECK_IN_TOPIC, vault_id), now);
+                }
+            }
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((TTL_POOL_CHECK_IN_TOPIC,), (pool_id, now, members.len() as u32));
+        Ok(())
+    }
+
+    /// Returns the TTL pool data for a given pool ID.
+    pub fn get_ttl_pool(env: Env, pool_id: u64) -> Option<TtlPool> {
+        env.storage().persistent().get(&DataKey::TtlPool(pool_id))
+    }
+
+    /// Returns the vault IDs that are members of a pool.
+    pub fn get_pool_vaults(env: Env, pool_id: u64) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TtlPoolVaults(pool_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Returns the pool ID a vault belongs to, if any.
+    pub fn get_vault_pool(env: Env, vault_id: u64) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::VaultPool(vault_id))
     }
 }

@@ -3718,3 +3718,227 @@ fn test_merge_vaults_same_token_succeeds() {
     client.merge_vaults(&target, &sources, &owner).unwrap();
     assert_eq!(client.get_vault(&target).balance, 50_000i128);
 }
+
+// ── Shared TTL Pool tests ─────────────────────────────────────────────────────
+
+#[test]
+fn test_create_ttl_pool_returns_id() {
+    let (_, owner, _, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    assert_eq!(pool_id, 1u64);
+}
+
+#[test]
+fn test_create_ttl_pool_increments_id() {
+    let (_, owner, _, _, _, client) = setup();
+    let id1 = client.create_ttl_pool(&owner, &3600u64);
+    let id2 = client.create_ttl_pool(&owner, &7200u64);
+    assert_eq!(id1, 1u64);
+    assert_eq!(id2, 2u64);
+}
+
+#[test]
+fn test_create_ttl_pool_stores_data() {
+    let (_, owner, _, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let pool = client.get_ttl_pool(&pool_id).expect("pool should exist");
+    assert_eq!(pool.owner, owner);
+    assert_eq!(pool.check_in_interval, 3600u64);
+    assert_eq!(pool.pool_id, pool_id);
+}
+
+#[test]
+fn test_create_ttl_pool_zero_interval_fails() {
+    let (_, owner, _, _, _, client) = setup();
+    let result = client.try_create_ttl_pool(&owner, &0u64);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_ttl_pool_emits_event() {
+    let (env, owner, _, _, _, client) = setup();
+    client.create_ttl_pool(&owner, &3600u64);
+    assert!(find_event_by_topic(&env, types::TTL_POOL_CREATED_TOPIC));
+}
+
+#[test]
+fn test_add_vault_to_pool_records_membership() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    let members = client.get_pool_vaults(&pool_id);
+    assert_eq!(members.len(), 1);
+    assert_eq!(members.get(0).unwrap(), vault_id);
+    assert_eq!(client.get_vault_pool(&vault_id), Some(pool_id));
+}
+
+#[test]
+fn test_add_vault_to_pool_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let other = Address::generate(&env);
+    assert!(client.try_add_vault_to_pool(&pool_id, &vault_id, &other).is_err());
+}
+
+#[test]
+fn test_add_vault_to_nonexistent_pool_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.try_add_vault_to_pool(&999u64, &vault_id, &owner).is_err());
+}
+
+#[test]
+fn test_add_vault_to_pool_duplicate_is_idempotent() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    assert_eq!(client.get_pool_vaults(&pool_id).len(), 1);
+}
+
+#[test]
+fn test_add_vault_to_pool_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_POOL_VAULT_ADDED_TOPIC));
+}
+
+#[test]
+fn test_remove_vault_from_pool_clears_membership() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+    client.remove_vault_from_pool(&vault_id, &owner).unwrap();
+
+    assert_eq!(client.get_pool_vaults(&pool_id).len(), 0);
+    assert_eq!(client.get_vault_pool(&vault_id), None);
+}
+
+#[test]
+fn test_remove_vault_from_pool_not_in_pool_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.try_remove_vault_from_pool(&vault_id, &owner).is_err());
+}
+
+#[test]
+fn test_remove_vault_from_pool_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+    client.remove_vault_from_pool(&vault_id, &owner).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_POOL_VAULT_REMOVED_TOPIC));
+}
+
+#[test]
+fn test_pool_check_in_resets_all_member_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id_1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault_id_2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_vault_to_pool(&pool_id, &vault_id_1, &owner).unwrap();
+    client.add_vault_to_pool(&pool_id, &vault_id_2, &owner).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    let now = env.ledger().timestamp();
+    client.pool_check_in(&pool_id, &owner).unwrap();
+
+    assert_eq!(client.get_vault(&vault_id_1).last_check_in, now);
+    assert_eq!(client.get_vault(&vault_id_2).last_check_in, now);
+}
+
+#[test]
+fn test_pool_check_in_extends_vault_expiry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 3500);
+    client.pool_check_in(&pool_id, &owner).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 3500);
+    assert!(!client.is_expired(&vault_id));
+}
+
+#[test]
+fn test_pool_check_in_non_owner_fails() {
+    let (env, owner, _, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    let other = Address::generate(&env);
+    assert!(client.try_pool_check_in(&pool_id, &other).is_err());
+}
+
+#[test]
+fn test_pool_check_in_nonexistent_pool_fails() {
+    let (_, owner, _, _, _, client) = setup();
+    assert!(client.try_pool_check_in(&999u64, &owner).is_err());
+}
+
+#[test]
+fn test_pool_check_in_paused_contract_fails() {
+    let (_, owner, _, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    client.pause();
+    assert!(client.try_pool_check_in(&pool_id, &owner).is_err());
+    client.unpause();
+}
+
+#[test]
+fn test_pool_check_in_emits_event() {
+    let (env, owner, _, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+    client.pool_check_in(&pool_id, &owner).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_POOL_CHECK_IN_TOPIC));
+}
+
+#[test]
+fn test_pool_check_in_skips_released_vaults() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &100u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500i128);
+    client.add_vault_to_pool(&pool_id, &vault_id, &owner).unwrap();
+
+    // Expire and release the vault
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    // Pool check-in should not panic even with a released vault in the pool
+    client.pool_check_in(&pool_id, &owner).unwrap();
+}
+
+#[test]
+fn test_multiple_vaults_in_pool_all_reset() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let pool_id = client.create_ttl_pool(&owner, &3600u64);
+
+    let ids: alloc::vec::Vec<u64> = (0..3)
+        .map(|_| {
+            let vid = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+            client.add_vault_to_pool(&pool_id, &vid, &owner).unwrap();
+            vid
+        })
+        .collect();
+
+    env.ledger().with_mut(|l| l.timestamp += 500);
+    let now = env.ledger().timestamp();
+    client.pool_check_in(&pool_id, &owner).unwrap();
+
+    for vid in &ids {
+        assert_eq!(client.get_vault(vid).last_check_in, now);
+    }
+}
