@@ -4418,3 +4418,423 @@ fn test_get_release_votes_empty_by_default() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
+
+// ── Hibernation ───────────────────────────────────────────────────────────────
+
+#[test]
+fn test_enter_hibernation_success() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    let h = client.get_hibernation(&id).unwrap();
+    assert_eq!(h.duration_seconds, 7200u64);
+}
+
+#[test]
+fn test_enter_hibernation_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_enter_hibernation(&id, &stranger, &3600u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_enter_hibernation_zero_duration_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_enter_hibernation(&id, &owner, &0u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(2)); // InvalidInterval
+}
+
+#[test]
+fn test_enter_hibernation_already_hibernating_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &3600u64).unwrap();
+    let err = client.try_enter_hibernation(&id, &owner, &3600u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // AlreadyHibernating
+}
+
+#[test]
+fn test_vault_not_expired_during_hibernation() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    // Advance past the normal check-in interval — vault should NOT be expired
+    env.ledger().with_mut(|l| l.timestamp += interval + 1);
+    assert!(!client.is_expired(&id));
+}
+
+#[test]
+fn test_vault_expires_after_hibernation_window_closes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let hibernation = 7200u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    client.enter_hibernation(&id, &owner, &hibernation).unwrap();
+
+    // Advance past interval + hibernation — vault should now be expired
+    env.ledger().with_mut(|l| l.timestamp += interval + hibernation + 1);
+    assert!(client.is_expired(&id));
+}
+
+#[test]
+fn test_exit_hibernation_success() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    // Hibernation entry should be gone
+    assert!(client.get_hibernation(&id).is_none());
+}
+
+#[test]
+fn test_exit_hibernation_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    let err = client.try_exit_hibernation(&id, &stranger).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_exit_hibernation_not_hibernating_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_exit_hibernation(&id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(56)); // NotHibernating
+}
+
+#[test]
+fn test_exit_hibernation_credits_elapsed_time() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    let before = client.get_vault(&id).last_check_in;
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    let elapsed = 1000u64;
+    env.ledger().with_mut(|l| l.timestamp += elapsed);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    let after = client.get_vault(&id).last_check_in;
+    assert_eq!(after, before + elapsed);
+}
+
+#[test]
+fn test_vault_not_expired_after_early_exit_within_interval() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let interval = 3600u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    // Exit after 1000 s — last_check_in bumped by 1000
+    env.ledger().with_mut(|l| l.timestamp += 1000);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    // Total elapsed from original last_check_in = 1000 s, interval = 3600 s → not expired
+    assert!(!client.is_expired(&id));
+}
+
+#[test]
+fn test_hibernation_emits_entered_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        if topics.is_empty() { return false; }
+        let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ent")).unwrap_or(false)
+    });
+    assert!(found, "hibernation_entered event not emitted");
+}
+
+#[test]
+fn test_hibernation_emits_exited_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.enter_hibernation(&id, &owner, &7200u64).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 500);
+    client.exit_hibernation(&id, &owner).unwrap();
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.0.try_into_val(&env).unwrap_or_else(|_| soroban_sdk::Vec::new(&env));
+        if topics.is_empty() { return false; }
+        let first: Result<soroban_sdk::Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        first.map(|s| s == soroban_sdk::Symbol::new(&env, "hib_ext")).unwrap_or(false)
+    });
+    assert!(found, "hibernation_exited event not emitted");
+}
+
+#[test]
+fn test_get_hibernation_returns_none_when_not_hibernating() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert!(client.get_hibernation(&id).is_none());
+}
+
+// ── Beneficiary Rotation Schedule Tests ──────────────────────────────────────
+
+fn make_beneficiary_entry(env: &Env, addr: Address, bps: u32) -> BeneficiaryEntry {
+    BeneficiaryEntry { address: addr, bps }
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_stores_entry() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let new_ben = Address::generate(&env);
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries);
+    let schedule = client.get_beneficiary_rotation_schedule(&id);
+    assert_eq!(schedule.len(), 1);
+    assert_eq!(schedule.get(0).unwrap().effective_timestamp, 9999u64);
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_non_owner_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let stranger = Address::generate(&env);
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, stranger.clone(), 10_000)];
+    let err = client.try_schedule_beneficiary_rotation(&id, &stranger, &9999u64, &entries)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_schedule_beneficiary_rotation_invalid_bps_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let new_ben = Address::generate(&env);
+    // bps = 5000, not 10_000
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 5_000)];
+    let err = client.try_schedule_beneficiary_rotation(&id, &owner, &9999u64, &entries)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(12)); // InvalidBps
+}
+
+#[test]
+fn test_get_beneficiary_rotation_schedule_empty_by_default() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 0);
+}
+
+#[test]
+fn test_multiple_rotation_entries_stored() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let ben_a = Address::generate(&env);
+    let ben_b = Address::generate(&env);
+    let entries_a = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_a.clone(), 10_000)];
+    let entries_b = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_b.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &1000u64, &entries_a);
+    client.schedule_beneficiary_rotation(&id, &owner, &2000u64, &entries_b);
+    assert_eq!(client.get_beneficiary_rotation_schedule(&id).len(), 2);
+}
+
+#[test]
+fn test_trigger_release_applies_rotation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    // Use a short interval so expiry is easy to simulate
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let new_ben = Address::generate(&env);
+    // Schedule rotation at timestamp 0 (always in the past)
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &0u64, &entries);
+
+    // Advance ledger past check-in interval to expire the vault
+    env.ledger().with_mut(|l| {
+        l.timestamp = 200;
+    });
+
+    client.trigger_release(&id);
+
+    // new_ben should have received the funds
+    let token = token::Client::new(&env, &token_address);
+    assert_eq!(token.balance(&new_ben), 1_000);
+}
+
+#[test]
+fn test_trigger_release_picks_latest_applicable_rotation() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let ben_early = Address::generate(&env);
+    let ben_late = Address::generate(&env);
+
+    // Two rotations: timestamp 1 (earlier) and timestamp 50 (later, still past)
+    let entries_early = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_early.clone(), 10_000)];
+    let entries_late = soroban_sdk::vec![&env, make_beneficiary_entry(&env, ben_late.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &1u64, &entries_early);
+    client.schedule_beneficiary_rotation(&id, &owner, &50u64, &entries_late);
+
+    env.ledger().with_mut(|l| { l.timestamp = 200; });
+    client.trigger_release(&id);
+
+    let token = token::Client::new(&env, &token_address);
+    // The later rotation (timestamp 50) should win
+    assert_eq!(token.balance(&ben_late), 1_000);
+    assert_eq!(token.balance(&ben_early), 0);
+}
+
+#[test]
+fn test_trigger_release_future_rotation_not_applied() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &1_000);
+    client.deposit(&id, &owner, &1_000);
+
+    let new_ben = Address::generate(&env);
+    // Schedule rotation far in the future
+    let entries = soroban_sdk::vec![&env, make_beneficiary_entry(&env, new_ben.clone(), 10_000)];
+    client.schedule_beneficiary_rotation(&id, &owner, &99999u64, &entries);
+
+    env.ledger().with_mut(|l| { l.timestamp = 200; });
+    client.trigger_release(&id);
+
+    let token = token::Client::new(&env, &token_address);
+    // Original beneficiary should receive funds, not new_ben
+    assert_eq!(token.balance(&beneficiary), 1_000);
+    assert_eq!(token.balance(&new_ben), 0);
+}
+
+// ── Inactivity Penalty Tests ──────────────────────────────────────────────────
+
+#[test]
+fn test_set_inactivity_penalty_stores_config() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.inactivity_penalty_bps, Some(500));
+    assert_eq!(vault.penalty_recipient, Some(recipient));
+}
+
+#[test]
+fn test_set_inactivity_penalty_non_owner_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_set_inactivity_penalty(&id, &stranger, &500u32, &stranger)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_set_inactivity_penalty_over_10000_rejected() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let err = client.try_set_inactivity_penalty(&id, &owner, &10_001u32, &recipient)
+        .unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(5)); // InvalidAmount
+}
+
+#[test]
+fn test_set_inactivity_penalty_zero_disables() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let recipient = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+    client.set_inactivity_penalty(&id, &owner, &0u32, &recipient);
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.inactivity_penalty_bps, None);
+    assert_eq!(vault.penalty_recipient, None);
+}
+
+#[test]
+fn test_check_in_deducts_penalty_for_missed_intervals() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 1000u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
+    client.deposit(&id, &owner, &10_000);
+    // 500 bps = 5% per missed interval
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+
+    // Advance 3 intervals (2 missed = 3 elapsed - 1 current)
+    env.ledger().with_mut(|l| { l.timestamp = interval * 3; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    // 2 missed intervals × 5% of 10_000 = 1_000 penalty
+    assert_eq!(token.balance(&recipient), 1_000);
+    assert_eq!(client.get_vault(&id).balance, 9_000);
+}
+
+#[test]
+fn test_check_in_no_penalty_when_on_time() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 1000u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &10_000);
+    client.deposit(&id, &owner, &10_000);
+    client.set_inactivity_penalty(&id, &owner, &500u32, &recipient);
+
+    // Advance less than one interval (no missed intervals)
+    env.ledger().with_mut(|l| { l.timestamp = interval / 2; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    assert_eq!(token.balance(&recipient), 0);
+    assert_eq!(client.get_vault(&id).balance, 10_000);
+}
+
+#[test]
+fn test_check_in_penalty_capped_at_balance() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let recipient = Address::generate(&env);
+    let interval = 100u64;
+    let id = client.create_vault(&owner, &beneficiary, &interval, &None);
+    StellarAssetClient::new(&env, &token_address).mint(&owner, &100);
+    client.deposit(&id, &owner, &100);
+    // 5000 bps = 50% per missed interval, many missed → would exceed balance
+    client.set_inactivity_penalty(&id, &owner, &5_000u32, &recipient);
+
+    // Advance 100 intervals (99 missed)
+    env.ledger().with_mut(|l| { l.timestamp = interval * 100; });
+
+    let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.check_in(&id, &owner, &dummy_hash);
+
+    let token = token::Client::new(&env, &token_address);
+    // Penalty capped at full balance
+    assert_eq!(token.balance(&recipient), 100);
+    assert_eq!(client.get_vault(&id).balance, 0);
+}
