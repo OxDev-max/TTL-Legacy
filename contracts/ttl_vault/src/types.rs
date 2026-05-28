@@ -494,3 +494,25 @@ pub struct VaultStatusSummary {
     pub last_check_in: u64,
     pub is_expired: bool,
 }
+
+/// A shared TTL pool that multiple vaults can join.
+/// A single `pool_check_in` resets `last_check_in` for all member vaults.
+#[contracttype]
+#[derive(Clone)]
+pub struct TtlPool {
+    pub pool_id: u64,
+    pub owner: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub created_at: u64,
+}
+
+/// A biometric credential entry (fingerprint or face template hash).
+/// The raw biometric data never leaves the device — only the SHA-256
+/// hash commitment is stored on-chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct BiometricEntry {
+    pub credential_hash: BytesN<32>,
+    pub added_at: u64,
+}
