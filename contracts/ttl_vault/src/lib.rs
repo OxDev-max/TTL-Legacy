@@ -6,7 +6,7 @@ use soroban_sdk::{
 };
 
 mod types;
-pub mod floors;
+pub mod ranking;
 use types::{
     BeneficiaryEntry, DataKey, ReleaseEvent, ReleaseStatus, ReleaseCondition, Vault, VestingSchedule,
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
